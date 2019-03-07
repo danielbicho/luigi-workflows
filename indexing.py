@@ -1,12 +1,18 @@
-from abc import ABC, abstractmethod
+from __future__ import print_function
 
-from luigi import ExternalTask, Parameter, WrapperTask, LocalTarget
+from abc import ABC, abstractmethod
+from io import StringIO
+
+from luigi import Parameter, WrapperTask, Task, LocalTarget
 from luigi.contrib.external_program import ExternalProgramTask
-from luigi.contrib.hdfs import HdfsTarget
+from luigi.contrib.hdfs import HdfsTarget, HdfsClientApache1
+from luigi.contrib.ssh import RemoteContext
 from plumbum.path.utils import move
 
 
 class ArquivoIndexingExternalTask(ExternalProgramTask, ABC):
+    data_collections_folder = Parameter(default="/data/collections")
+    document_server = Parameter(default="p64.arquivo.pt")
     lucene_jar = Parameter(default="/opt/searcher/scripts/lib/pwalucene-1.0.0-SNAPSHOT.jar")
     hadoop_bin = Parameter(default="/opt/searcher/hadoop/bin/hadoop")
     collection_name = Parameter(default='dummy')
@@ -32,15 +38,46 @@ class ArquivoIndexingExternalTask(ExternalProgramTask, ABC):
         return LocalTarget(self.checkpoint_file).exists()
 
 
-# TODO do a task to create this file
-class ArcList(ExternalTask):
-    arc_list = Parameter(default='inputs/arcs.txt')
+class GenerateArcList(Task):
+    """
+    Connects to a Document Server and builds a list of (W)ARC that will be indexed. Keys need to be exchanged.
+    """
+    data_collections_folder = Parameter(default="/data/collections")
+    collection_name = Parameter(default="dummy")
+    document_server = Parameter(default="p64.arquivo.pt")
+    data_folder = Parameter(default='/data')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.checkpoint_file = self.set_checkpoint()
 
     def complete(self):
-        return True
+        return LocalTarget(self.checkpoint_file).exists()
+
+    def on_success(self):
+        with open(self.checkpoint_file, mode='w'):
+            pass
+        super().on_success()
+
+    def set_checkpoint(self):
+        return "{}/{}.generatearc.checkpoint".format(self.data_folder, self.collection_name)
 
     def output(self):
-        return HdfsTarget(self.arc_list)
+        input_path_name = 'inputs_{}'.format(self.collection_name)
+        hdfs_client = HdfsClientApache1()
+        hdfs_client.mkdir(input_path_name)
+
+        return HdfsTarget('inputs_{}/arcs.txt'.format(self.collection_name))
+
+    def run(self):
+        remote = RemoteContext(self.document_server)
+
+        with self.output().open('w') as outfile:
+            stream = StringIO(remote.check_output(["cd {} && find ./{} -type f -regex \".*[w]*arc\.gz\"".format(
+                self.data_collections_folder, self.collection_name)]).decode())
+
+            for line in stream:
+                outfile.write(line.replace('./', 'http://{}:8080/browser/files/'.format(self.document_server)))
 
 
 class ImportCollectionHadoop(ArquivoIndexingExternalTask):
@@ -52,7 +89,8 @@ class ImportCollectionHadoop(ArquivoIndexingExternalTask):
         return hadoop_arglist
 
     def requires(self):
-        return ArcList(arc_list="inputs_{}/arcs.txt".format(self.collection_name))
+        return GenerateArcList(data_collections_folder=self.data_collections_folder,
+                               collection_name=self.collection_name, document_server=self.document_server)
 
     def on_success(self):
         with open(self.checkpoint_file, mode='w'):
@@ -77,7 +115,7 @@ class UpdateCrawlDBHadoop(ArquivoIndexingExternalTask):
 
     def requires(self):
         return ImportCollectionHadoop(collection_name=self.collection_name, data_folder=self.data_folder,
-                                      hadoop_jar=self.hadoop_jar)
+                                      hadoop_jar=self.hadoop_jar, document_server=self.document_server)
 
 
 class CreateLinkDB(ArquivoIndexingExternalTask):
@@ -91,7 +129,7 @@ class CreateLinkDB(ArquivoIndexingExternalTask):
 
     def requires(self):
         return UpdateCrawlDBHadoop(collection_name=self.collection_name, data_folder=self.data_folder,
-                                   hadoop_jar=self.hadoop_jar)
+                                   hadoop_jar=self.hadoop_jar, document_server=self.document_server)
 
 
 class IndexCollection(ArquivoIndexingExternalTask):
@@ -105,7 +143,7 @@ class IndexCollection(ArquivoIndexingExternalTask):
 
     def requires(self):
         return CreateLinkDB(collection_name=self.collection_name, data_folder=self.data_folder,
-                            hadoop_jar=self.hadoop_jar)
+                            hadoop_jar=self.hadoop_jar, document_server=self.document_server)
 
 
 class MergeIndexSegments(ArquivoIndexingExternalTask):
@@ -119,7 +157,7 @@ class MergeIndexSegments(ArquivoIndexingExternalTask):
 
     def requires(self):
         return IndexCollection(collection_name=self.collection_name, data_folder=self.data_folder,
-                               hadoop_jar=self.hadoop_jar)
+                               hadoop_jar=self.hadoop_jar, document_server=self.document_server)
 
 
 class CopyIndexesFromHdfs(ArquivoIndexingExternalTask):
@@ -134,7 +172,7 @@ class CopyIndexesFromHdfs(ArquivoIndexingExternalTask):
 
     def requires(self):
         return MergeIndexSegments(collection_name=self.collection_name, data_folder=self.data_folder,
-                                  hadoop_jar=self.hadoop_jar)
+                                  hadoop_jar=self.hadoop_jar, document_server=self.document_server)
 
 
 # Sort a Nutch index by page score.
@@ -146,7 +184,7 @@ class SortIndexes(ArquivoIndexingExternalTask):
 
     def requires(self):
         return CopyIndexesFromHdfs(collection_name=self.collection_name, data_folder=self.data_folder,
-                                   hadoop_jar=self.hadoop_jar)
+                                   hadoop_jar=self.hadoop_jar, document_server=self.document_server)
 
     def program_args(self):
         hadoop_arglist = [self.hadoop_bin, 'jar', self.hadoop_jar,
@@ -166,7 +204,8 @@ class PruneIndexes(ArquivoIndexingExternalTask):
 
     def requires(self):
         return SortIndexes(collection_name=self.collection_name, data_folder=self.data_folder,
-                           hadoop_jar=self.hadoop_jar)
+                           hadoop_jar=self.hadoop_jar, lucene_jar=self.lucene_jar, hadoop_bin=self.hadoop_bin,
+                           document_server=self.document_server)
 
     def program_args(self):
         # org.apache.lucene.pruning.PruningTool -impl arquivo -in $INDEX_DIR -out $INDEX_DIR_OUT -del pagerank:pPsv,outlinks:pPsv -t 1
@@ -194,10 +233,12 @@ class StartIndexCollection(WrapperTask):
     hadoop_jar = Parameter(default="/opt/searcher/scripts/nutchwax-job-0.11.0-SNAPSHOT.jar")
     hadoop_bin = Parameter(default="/opt/searcher/hadoop/bin/hadoop")
     lucene_jar = Parameter(default="/opt/searcher/scripts/lib/pwalucene-1.0.0-SNAPSHOT.jar")
+    document_server = Parameter(default="p64.arquivo.pt")
 
     def complete(self):
         return False
 
     def requires(self):
         return PruneIndexes(collection_name=self.collection_name, data_folder=self.data_folder,
-                            hadoop_jar=self.hadoop_jar, lucene_jar=self.lucene_jar, hadoop_bin=self.hadoop_bin)
+                            hadoop_jar=self.hadoop_jar, lucene_jar=self.lucene_jar, hadoop_bin=self.hadoop_bin,
+                            document_server=self.document_server)
